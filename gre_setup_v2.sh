@@ -7,12 +7,9 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
-CONFIG_FILE="/etc/gre_tunnels.conf"
+CONFIG_FILE="/etc/gre_tunnels.json"
+CONFIG_FILE_OLD="/etc/gre_tunnels.conf"
 AUTHOR="Arman2122"
-
-SYSTEMD_DIR="/etc/systemd/system"
-SERVICE_PREFIX="gre-"
-HELPER_SCRIPT="/usr/local/sbin/gre-tunnel"
 
 RED="\e[31m"
 GREEN="\e[32m"
@@ -25,10 +22,217 @@ BOLD="\e[1m"
 DIM="\e[2m"
 RESET="\e[0m"
 
+SYSTEMD_DIR="/etc/systemd/system"
+SERVICE_PREFIX="gre-"
+HELPER_SCRIPT="/usr/local/sbin/gre-tunnel"
+
 BG_RED="\e[41m"
 BG_GREEN="\e[42m"
 BG_YELLOW="\e[43m"
 BG_BLUE="\e[44m"
+
+detect_os() {
+    if [[ -f /etc/os-release ]]; then
+        . /etc/os-release
+        OS_ID="$ID"
+        OS_VERSION_ID="$VERSION_ID"
+    elif [[ -f /etc/debian_version ]]; then
+        OS_ID="debian"
+        OS_VERSION_ID=$(cat /etc/debian_version)
+    elif [[ -f /etc/redhat-release ]]; then
+        OS_ID="rhel"
+        OS_VERSION_ID=$(cat /etc/redhat-release)
+    else
+        OS_ID="unknown"
+        OS_VERSION_ID="unknown"
+    fi
+}
+
+check_dependencies() {
+    local missing_pkgs=()
+    local pkg_manager=""
+    local update_cmd=""
+    local install_cmd=""
+    
+    detect_os
+    
+    # Determine package manager
+    if command -v apt-get >/dev/null 2>&1; then
+        pkg_manager="apt-get"
+        update_cmd="apt-get update -qq"
+        install_cmd="apt-get install -y -qq"
+    elif command -v yum >/dev/null 2>&1; then
+        pkg_manager="yum"
+        update_cmd="true"
+        install_cmd="yum install -y -q"
+    elif command -v dnf >/dev/null 2>&1; then
+        pkg_manager="dnf"
+        update_cmd="true"
+        install_cmd="dnf install -y -q"
+    elif command -v pacman >/dev/null 2>&1; then
+        pkg_manager="pacman"
+        update_cmd="pacman -Sy --noconfirm"
+        install_cmd="pacman -S --noconfirm --needed"
+    else
+        echo -e "${RED}❌ Error: Could not detect package manager.${RESET}" >&2
+        echo -e "${YELLOW}   Please install required packages manually: iproute2, systemd, kmod, iputils-ping, jq${RESET}" >&2
+        return 1
+    fi
+    
+    # Check required commands and map to packages
+    if ! command -v ip >/dev/null 2>&1; then
+        if [[ "$pkg_manager" == "apt-get" ]]; then
+            missing_pkgs+=("iproute2")
+        elif [[ "$pkg_manager" == "yum" ]] || [[ "$pkg_manager" == "dnf" ]]; then
+            missing_pkgs+=("iproute")
+        elif [[ "$pkg_manager" == "pacman" ]]; then
+            missing_pkgs+=("iproute2")
+        fi
+    fi
+    
+    if ! command -v systemctl >/dev/null 2>&1; then
+        if [[ "$pkg_manager" == "apt-get" ]]; then
+            missing_pkgs+=("systemd")
+        elif [[ "$pkg_manager" == "yum" ]] || [[ "$pkg_manager" == "dnf" ]]; then
+            missing_pkgs+=("systemd")
+        elif [[ "$pkg_manager" == "pacman" ]]; then
+            missing_pkgs+=("systemd")
+        fi
+    fi
+    
+    if ! command -v modprobe >/dev/null 2>&1; then
+        if [[ "$pkg_manager" == "apt-get" ]]; then
+            missing_pkgs+=("kmod")
+        elif [[ "$pkg_manager" == "yum" ]] || [[ "$pkg_manager" == "dnf" ]]; then
+            missing_pkgs+=("kmod")
+        elif [[ "$pkg_manager" == "pacman" ]]; then
+            missing_pkgs+=("kmod")
+        fi
+    fi
+    
+    if ! command -v ping >/dev/null 2>&1; then
+        if [[ "$pkg_manager" == "apt-get" ]]; then
+            missing_pkgs+=("iputils-ping")
+        elif [[ "$pkg_manager" == "yum" ]] || [[ "$pkg_manager" == "dnf" ]]; then
+            missing_pkgs+=("iputils")
+        elif [[ "$pkg_manager" == "pacman" ]]; then
+            missing_pkgs+=("iputils")
+        fi
+    fi
+    
+    if ! command -v jq >/dev/null 2>&1; then
+        missing_pkgs+=("jq")
+    fi
+    
+    # Optional but recommended
+    if ! command -v curl >/dev/null 2>&1; then
+        missing_pkgs+=("curl")
+    fi
+    
+    # Install missing packages
+    if [[ ${#missing_pkgs[@]} -gt 0 ]]; then
+        echo -e "${YELLOW}⚠️  Missing dependencies detected. Installing...${RESET}"
+        echo -e "${DIM}   Packages needed: ${missing_pkgs[*]}${RESET}"
+        
+        # Update package list
+        eval "$update_cmd" >/dev/null 2>&1
+        
+        # Install packages
+        if eval "$install_cmd ${missing_pkgs[*]}" >/dev/null 2>&1; then
+            echo -e "${GREEN}✅ Dependencies installed successfully!${RESET}"
+        else
+            echo -e "${RED}❌ Error: Failed to install dependencies.${RESET}" >&2
+            echo -e "${YELLOW}   Please install manually: ${missing_pkgs[*]}${RESET}" >&2
+            return 1
+        fi
+    fi
+    
+    # Verify critical commands
+    if ! command -v ip >/dev/null 2>&1 || ! command -v systemctl >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1; then
+        echo -e "${RED}❌ Error: Critical dependencies are still missing after installation.${RESET}" >&2
+        return 1
+    fi
+    
+    return 0
+}
+
+init_json_config() {
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        echo '{"tunnels":[]}' > "$CONFIG_FILE"
+        chmod 600 "$CONFIG_FILE"
+    fi
+}
+
+get_all_tunnels() {
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        return 1
+    fi
+    
+    jq -c '.tunnels[]' "$CONFIG_FILE" 2>/dev/null
+}
+
+get_tunnel_by_name() {
+    local tunnel_name="$1"
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        return 1
+    fi
+    
+    jq -c ".tunnels[] | select(.tunnel == \"$tunnel_name\")" "$CONFIG_FILE" 2>/dev/null
+}
+
+tunnel_exists() {
+    local tunnel_name="$1"
+    local count=$(jq -r "[.tunnels[] | select(.tunnel == \"$tunnel_name\")] | length" "$CONFIG_FILE" 2>/dev/null)
+    [[ "$count" -gt 0 ]] && return 0 || return 1
+}
+
+add_tunnel_to_json() {
+    local tunnel="$1"
+    local version="$2"
+    local side="$3"
+    local local_ip="$4"
+    local remote_ip="$5"
+    local tunnel_ip="$6"
+    local mtu="$7"
+    
+    init_json_config
+    
+    local new_tunnel=$(jq -n \
+        --arg t "$tunnel" \
+        --arg v "$version" \
+        --arg s "$side" \
+        --arg l "$local_ip" \
+        --arg r "$remote_ip" \
+        --arg ti "$tunnel_ip" \
+        --arg m "$mtu" \
+        '{tunnel: $t, version: $v, side: $s, local_ip: $l, remote_ip: $r, tunnel_ip: $ti, mtu: $m}')
+    
+    jq ".tunnels += [$new_tunnel]" "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && \
+    mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
+}
+
+remove_tunnel_from_json() {
+    local tunnel_name="$1"
+    
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        return 1
+    fi
+    
+    jq "del(.tunnels[] | select(.tunnel == \"$tunnel_name\"))" "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && \
+    mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
+}
+
+update_tunnel_ip_in_json() {
+    local tunnel_name="$1"
+    local new_ip="$2"
+    
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        return 1
+    fi
+    
+    jq "(.tunnels[] | select(.tunnel == \"$tunnel_name\") | .tunnel_ip) = \"$new_ip\"" "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && \
+    mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
+}
 
 banner() {
     clear
@@ -215,8 +419,11 @@ validate_ip() {
                 fi
             done
             return 0
-        elif [[ $ip =~ ^([0-9a-fA-F]{0,4}:){1,7}[0-9a-fA-F]{0,4}$ ]] || [[ $ip =~ ^::1$ ]] || [[ $ip =~ ^::$ ]]; then
-            return 0
+        fi
+        if command -v ip >/dev/null 2>&1; then
+            if ip -6 route get "$ip" >/dev/null 2>&1; then
+                return 0
+            fi
         fi
         return 1
     elif [[ "$version" == "4" ]]; then
@@ -231,8 +438,22 @@ validate_ip() {
         fi
         return 1
     elif [[ "$version" == "6" ]]; then
-        if [[ $ip =~ ^([0-9a-fA-F]{0,4}:){1,7}[0-9a-fA-F]{0,4}$ ]] || [[ $ip =~ ^::1$ ]] || [[ $ip =~ ^::$ ]]; then
-            return 0
+        if command -v ip >/dev/null 2>&1; then
+            if ip -6 route get "$ip" >/dev/null 2>&1; then
+                return 0
+            fi
+        fi
+        if [[ $ip =~ ^([0-9a-fA-F]{0,4}:){1,7}[0-9a-fA-F]{0,4}$ ]] || \
+           [[ $ip =~ ^::1$ ]] || \
+           [[ $ip =~ ^::$ ]] || \
+           [[ $ip =~ ^[0-9a-fA-F]{0,4}::[0-9a-fA-F]{0,4}$ ]] || \
+           [[ $ip =~ ^([0-9a-fA-F]{0,4}:)+::([0-9a-fA-F]{0,4}:)*[0-9a-fA-F]{0,4}$ ]] || \
+           [[ $ip =~ ^::([0-9a-fA-F]{0,4}:)*[0-9a-fA-F]{0,4}$ ]] || \
+           [[ $ip =~ ^([0-9a-fA-F]{0,4}:)+::$ ]]; then
+            local colon_count=$(echo "$ip" | tr -cd ':' | wc -c)
+            if [[ $colon_count -ge 1 && $colon_count -le 7 ]]; then
+                return 0
+            fi
         fi
         return 1
     fi
@@ -243,43 +464,37 @@ validate_cidr() {
     local cidr=$1
     local version=$2  # optional: "4" or "6"
     
+    if [[ ! "$cidr" =~ / ]]; then
+        return 1
+    fi
+    
+    local ip_part=$(echo "$cidr" | cut -d'/' -f1)
+    local prefix_part=$(echo "$cidr" | cut -d'/' -f2)
+    
     if [[ -z "$version" ]]; then
         if [[ $cidr =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}/[0-9]{1,2}$ ]]; then
-            local ip_part=$(echo "$cidr" | cut -d'/' -f1)
-            local prefix_part=$(echo "$cidr" | cut -d'/' -f2)
             if validate_ip "$ip_part" "4" && [[ $prefix_part -ge 0 && $prefix_part -le 32 ]]; then
                 return 0
             fi
-        elif [[ $cidr =~ ^([0-9a-fA-F]{0,4}:){1,7}[0-9a-fA-F]{0,4}/[0-9]{1,3}$ ]] || [[ $cidr =~ ^::1/[0-9]{1,3}$ ]] || [[ $cidr =~ ^::/[0-9]{1,3}$ ]]; then
-            local prefix_part=$(echo "$cidr" | cut -d'/' -f2)
-            if [[ $prefix_part -ge 0 && $prefix_part -le 128 ]]; then
-                return 0
-            fi
+        fi
+        if validate_ip "$ip_part" "6" && [[ $prefix_part =~ ^[0-9]+$ ]] && [[ $prefix_part -ge 0 && $prefix_part -le 128 ]]; then
+            return 0
         fi
         return 1
     elif [[ "$version" == "4" ]]; then
         if [[ $cidr =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}/[0-9]{1,2}$ ]]; then
-            local ip_part=$(echo "$cidr" | cut -d'/' -f1)
-            local prefix_part=$(echo "$cidr" | cut -d'/' -f2)
             if validate_ip "$ip_part" "4" && [[ $prefix_part -ge 0 && $prefix_part -le 32 ]]; then
                 return 0
             fi
         fi
         return 1
     elif [[ "$version" == "6" ]]; then
-        if [[ $cidr =~ ^([0-9a-fA-F]{0,4}:){1,7}[0-9a-fA-F]{0,4}/[0-9]{1,3}$ ]] || [[ $cidr =~ ^::1/[0-9]{1,3}$ ]] || [[ $cidr =~ ^::/[0-9]{1,3}$ ]]; then
-            local prefix_part=$(echo "$cidr" | cut -d'/' -f2)
-            if [[ $prefix_part -ge 0 && $prefix_part -le 128 ]]; then
-                return 0
-            fi
+        if validate_ip "$ip_part" "6" && [[ $prefix_part =~ ^[0-9]+$ ]] && [[ $prefix_part -ge 0 && $prefix_part -le 128 ]]; then
+            return 0
         fi
         return 1
     fi
     return 1
-}
-
-save_config() {
-    echo "$1" >> "$CONFIG_FILE"
 }
 
 # validate MTU value
@@ -396,10 +611,19 @@ list_tunnels() {
     echo -e "${BOLD}${YELLOW}📋 Configured Tunnels:${RESET}"
     echo -e "${DIM}┌─────────────────────────────────────────────────────────────┐${RESET}"
     
-    if [[ -f "$CONFIG_FILE" && -s "$CONFIG_FILE" ]]; then
+    if [[ -f "$CONFIG_FILE" ]]; then
         local count=0
-        while IFS=',' read -r tunnel version side local_ip remote_ip tunnel_ip mtu; do
+        while IFS= read -r tunnel_json; do
+            [[ -z "$tunnel_json" ]] && continue
             ((count++))
+            local tunnel=$(echo "$tunnel_json" | jq -r '.tunnel')
+            local version=$(echo "$tunnel_json" | jq -r '.version')
+            local side=$(echo "$tunnel_json" | jq -r '.side')
+            local local_ip=$(echo "$tunnel_json" | jq -r '.local_ip')
+            local remote_ip=$(echo "$tunnel_json" | jq -r '.remote_ip')
+            local tunnel_ip=$(echo "$tunnel_json" | jq -r '.tunnel_ip')
+            local mtu=$(echo "$tunnel_json" | jq -r '.mtu')
+            
             echo -e "${DIM}│${RESET} ${BOLD}${CYAN}Tunnel #$count:${RESET} $tunnel"
             echo -e "${DIM}│${RESET}   ${GREEN}•${RESET} Type: IPv$version GRE"
             echo -e "${DIM}│${RESET}   ${GREEN}•${RESET} Side: $side"
@@ -408,7 +632,11 @@ list_tunnels() {
             echo -e "${DIM}│${RESET}   ${GREEN}•${RESET} Tunnel IP: $tunnel_ip"
             echo -e "${DIM}│${RESET}   ${GREEN}•${RESET} MTU: $mtu"
             echo -e "${DIM}│${RESET}"
-        done < "$CONFIG_FILE"
+        done < <(get_all_tunnels)
+        
+        if [[ $count -eq 0 ]]; then
+            echo -e "${DIM}│${RESET} ${YELLOW}No tunnels configured yet.${RESET}"
+        fi
     else
         echo -e "${DIM}│${RESET} ${YELLOW}No tunnels configured yet.${RESET}"
     fi
@@ -423,7 +651,14 @@ show_tunnel_status() {
     echo -e "${DIM}─────────────────────────────────────────────────────────────${RESET}"
     echo
 
-    if [[ ! -f "$CONFIG_FILE" || ! -s "$CONFIG_FILE" ]]; then
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        echo -e "${YELLOW}⚠️  No tunnels configured yet.${RESET}"
+        echo
+        return
+    fi
+    
+    local tunnel_count=$(jq -r '.tunnels | length' "$CONFIG_FILE" 2>/dev/null || echo "0")
+    if [[ "$tunnel_count" == "0" ]]; then
         echo -e "${YELLOW}⚠️  No tunnels configured yet.${RESET}"
         echo
         return
@@ -435,8 +670,12 @@ show_tunnel_status() {
     
     local count=0
     local tunnels=()
-    while IFS=',' read -r tunnel version side local_ip remote_ip tunnel_ip mtu; do
+    while IFS= read -r tunnel_json; do
+        [[ -z "$tunnel_json" ]] && continue
         ((count++))
+        local tunnel=$(echo "$tunnel_json" | jq -r '.tunnel')
+        local version=$(echo "$tunnel_json" | jq -r '.version')
+        local tunnel_ip=$(echo "$tunnel_json" | jq -r '.tunnel_ip')
         tunnels+=("$tunnel")
         
         local tunnel_status=$(check_tunnel_status "$tunnel")
@@ -484,7 +723,7 @@ show_tunnel_status() {
         echo -e "${DIM}│${RESET} ${status_icon} ${BOLD}${CYAN}[$count]${RESET} ${CYAN}$tunnel${RESET}"
         echo -e "${DIM}│${RESET}    ${DIM}Status:${RESET} $status_text | ${DIM}Service:${RESET} $svc_status${ping_info}"
         echo -e "${DIM}│${RESET}"
-    done < "$CONFIG_FILE"
+    done < <(get_all_tunnels)
     
     echo -e "${DIM}└─────────────────────────────────────────────────────────────┘${RESET}"
     echo
@@ -505,26 +744,35 @@ show_tunnel_status() {
     if [[ "$selection" == "a" || "$selection" == "A" ]]; then
         # show all tunnels in detail
         local idx=0
-        while IFS=',' read -r tunnel version side local_ip remote_ip tunnel_ip mtu; do
+        while IFS= read -r tunnel_json; do
+            [[ -z "$tunnel_json" ]] && continue
             ((idx++))
+            local tunnel=$(echo "$tunnel_json" | jq -r '.tunnel')
+            local version=$(echo "$tunnel_json" | jq -r '.version')
+            local side=$(echo "$tunnel_json" | jq -r '.side')
+            local local_ip=$(echo "$tunnel_json" | jq -r '.local_ip')
+            local remote_ip=$(echo "$tunnel_json" | jq -r '.remote_ip')
+            local tunnel_ip=$(echo "$tunnel_json" | jq -r '.tunnel_ip')
+            local mtu=$(echo "$tunnel_json" | jq -r '.mtu')
+            
             show_detailed_tunnel_status "$tunnel" "$version" "$side" "$local_ip" "$remote_ip" "$tunnel_ip" "$mtu"
             if [[ $idx -lt $count ]]; then
                 echo
                 echo -e "${DIM}─────────────────────────────────────────────────────────────${RESET}"
                 echo
             fi
-        done < "$CONFIG_FILE"
+        done < <(get_all_tunnels)
     elif [[ "$selection" =~ ^[0-9]+$ ]]; then
         if [[ $selection -ge 1 && $selection -le $count ]]; then
             TUNNEL="${tunnels[$((selection-1))]}"
-            TUNNEL_INFO=$(grep "^$TUNNEL," "$CONFIG_FILE")
-            if [[ -n "$TUNNEL_INFO" ]]; then
-                CURRENT_VERSION=$(echo "$TUNNEL_INFO" | cut -d',' -f2)
-                CURRENT_SIDE=$(echo "$TUNNEL_INFO" | cut -d',' -f3)
-                CURRENT_LOCAL_IP=$(echo "$TUNNEL_INFO" | cut -d',' -f4)
-                CURRENT_REMOTE_IP=$(echo "$TUNNEL_INFO" | cut -d',' -f5)
-                CURRENT_TUNNEL_IP=$(echo "$TUNNEL_INFO" | cut -d',' -f6)
-                CURRENT_MTU=$(echo "$TUNNEL_INFO" | cut -d',' -f7)
+            local tunnel_json=$(get_tunnel_by_name "$TUNNEL")
+            if [[ -n "$tunnel_json" ]]; then
+                CURRENT_VERSION=$(echo "$tunnel_json" | jq -r '.version')
+                CURRENT_SIDE=$(echo "$tunnel_json" | jq -r '.side')
+                CURRENT_LOCAL_IP=$(echo "$tunnel_json" | jq -r '.local_ip')
+                CURRENT_REMOTE_IP=$(echo "$tunnel_json" | jq -r '.remote_ip')
+                CURRENT_TUNNEL_IP=$(echo "$tunnel_json" | jq -r '.tunnel_ip')
+                CURRENT_MTU=$(echo "$tunnel_json" | jq -r '.mtu')
                 
                 show_detailed_tunnel_status "$TUNNEL" "$CURRENT_VERSION" "$CURRENT_SIDE" "$CURRENT_LOCAL_IP" "$CURRENT_REMOTE_IP" "$CURRENT_TUNNEL_IP" "$CURRENT_MTU"
             fi
@@ -699,11 +947,9 @@ create_tunnel() {
             continue
         fi
         # check if tunnel name already exists
-        if [[ -f "$CONFIG_FILE" ]]; then
-            if grep -q "^$TUNNEL," "$CONFIG_FILE"; then
-                echo -e "${RED}❌ Tunnel name '$TUNNEL' already exists. Please choose a different name.${RESET}"
-                continue
-            fi
+        if tunnel_exists "$TUNNEL"; then
+            echo -e "${RED}❌ Tunnel name '$TUNNEL' already exists. Please choose a different name.${RESET}"
+            continue
         fi
         # check if tunnel interface already exists
         if ip link show "$TUNNEL" >/dev/null 2>&1; then
@@ -889,7 +1135,7 @@ create_tunnel() {
 	ip link set $TUNNEL mtu $MTU
 	ip link set $TUNNEL up
 
-	save_config "$TUNNEL,$VERSION,$SIDE,$LOCAL_IP,$REMOTE_IP,$TUNNEL_IP,$MTU"
+	add_tunnel_to_json "$TUNNEL" "$VERSION" "$SIDE" "$LOCAL_IP" "$REMOTE_IP" "$TUNNEL_IP" "$MTU"
 
 	# create and start systemd 
 	create_systemd_service "$TUNNEL" "$VERSION" "$SIDE" "$LOCAL_IP" "$REMOTE_IP" "$TUNNEL_IP" "$MTU"
@@ -908,7 +1154,14 @@ delete_tunnel() {
     echo -e "${DIM}─────────────────────────────────────────────────────────────${RESET}"
     echo
 
-    if [[ ! -f "$CONFIG_FILE" || ! -s "$CONFIG_FILE" ]]; then
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        echo -e "${YELLOW}⚠️  No tunnels configured to delete.${RESET}"
+        echo
+        return
+    fi
+    
+    local tunnel_count=$(jq -r '.tunnels | length' "$CONFIG_FILE" 2>/dev/null || echo "0")
+    if [[ "$tunnel_count" == "0" ]]; then
         echo -e "${YELLOW}⚠️  No tunnels configured to delete.${RESET}"
         echo
         return
@@ -917,11 +1170,16 @@ delete_tunnel() {
     echo -e "${BOLD}${YELLOW}📋 Available Tunnels:${RESET}"
     local count=0
     local tunnels=()
-    while IFS=',' read -r tunnel version side local_ip remote_ip tunnel_ip mtu; do
+    while IFS= read -r tunnel_json; do
+        [[ -z "$tunnel_json" ]] && continue
         ((count++))
+        local tunnel=$(echo "$tunnel_json" | jq -r '.tunnel')
+        local version=$(echo "$tunnel_json" | jq -r '.version')
+        local side=$(echo "$tunnel_json" | jq -r '.side')
+        local tunnel_ip=$(echo "$tunnel_json" | jq -r '.tunnel_ip')
         tunnels+=("$tunnel")
         echo -e "   ${DIM}[$count]${RESET} ${CYAN}$tunnel${RESET} (IPv$version, $side, $tunnel_ip)"
-    done < "$CONFIG_FILE"
+    done < <(get_all_tunnels)
     echo
 
     while true; do
@@ -957,7 +1215,7 @@ delete_tunnel() {
 
 	ip link set $TUNNEL down 2>/dev/null
 	ip tunnel del $TUNNEL 2>/dev/null
-	sed -i "/^$TUNNEL,/d" "$CONFIG_FILE"
+	remove_tunnel_from_json "$TUNNEL"
 
         echo -e "${BOLD}${GREEN}✅ Tunnel $TUNNEL deleted successfully!${RESET}"
     else
@@ -972,7 +1230,14 @@ change_tunnel_ip() {
     echo -e "${DIM}─────────────────────────────────────────────────────────────${RESET}"
     echo
 
-    if [[ ! -f "$CONFIG_FILE" || ! -s "$CONFIG_FILE" ]]; then
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        echo -e "${YELLOW}⚠️  No tunnels configured to modify.${RESET}"
+        echo
+        return
+    fi
+    
+    local tunnel_count=$(jq -r '.tunnels | length' "$CONFIG_FILE" 2>/dev/null || echo "0")
+    if [[ "$tunnel_count" == "0" ]]; then
         echo -e "${YELLOW}⚠️  No tunnels configured to modify.${RESET}"
         echo
         return
@@ -981,11 +1246,14 @@ change_tunnel_ip() {
     echo -e "${BOLD}${YELLOW}📋 Available Tunnels:${RESET}"
     local count=0
     local tunnels=()
-    while IFS=',' read -r tunnel version side local_ip remote_ip tunnel_ip mtu; do
+    while IFS= read -r tunnel_json; do
+        [[ -z "$tunnel_json" ]] && continue
         ((count++))
+        local tunnel=$(echo "$tunnel_json" | jq -r '.tunnel')
+        local tunnel_ip=$(echo "$tunnel_json" | jq -r '.tunnel_ip')
         tunnels+=("$tunnel")
         echo -e "   ${DIM}[$count]${RESET} ${CYAN}$tunnel${RESET} - Current IP: ${GREEN}$tunnel_ip${RESET}"
-    done < "$CONFIG_FILE"
+    done < <(get_all_tunnels)
     echo
 
     while true; do
@@ -1008,13 +1276,18 @@ change_tunnel_ip() {
         fi
     done
 
-    OLD_IP=$(grep "^$TUNNEL," "$CONFIG_FILE" | cut -d',' -f6)
+    local tunnel_json=$(get_tunnel_by_name "$TUNNEL")
+    if [[ -z "$tunnel_json" ]]; then
+        echo -e "${RED}❌ Tunnel not found.${RESET}"
+        return
+    fi
+    
+    OLD_IP=$(echo "$tunnel_json" | jq -r '.tunnel_ip')
     echo -e "${BOLD}${BLUE}Current tunnel IP: ${GREEN}$OLD_IP${RESET}"
     echo
 
-    TUNNEL_INFO=$(grep "^$TUNNEL," "$CONFIG_FILE")
-    CURRENT_VERSION=$(echo "$TUNNEL_INFO" | cut -d',' -f2)
-    CURRENT_SIDE=$(echo "$TUNNEL_INFO" | cut -d',' -f3)
+    CURRENT_VERSION=$(echo "$tunnel_json" | jq -r '.version')
+    CURRENT_SIDE=$(echo "$tunnel_json" | jq -r '.side')
     
     while true; do
         echo -e "${BOLD}${YELLOW}New Tunnel IP:${RESET}"
@@ -1064,14 +1337,14 @@ change_tunnel_ip() {
         ip addr add $NEW_IP dev $TUNNEL
 
         # update config file
-        sed -i "s#$OLD_IP#$NEW_IP#g" "$CONFIG_FILE"
+        update_tunnel_ip_in_json "$TUNNEL" "$NEW_IP"
         
-        TUNNEL_INFO=$(grep "^$TUNNEL," "$CONFIG_FILE")
-        CURRENT_VERSION=$(echo "$TUNNEL_INFO" | cut -d',' -f2)
-        CURRENT_SIDE=$(echo "$TUNNEL_INFO" | cut -d',' -f3)
-        CURRENT_LOCAL_IP=$(echo "$TUNNEL_INFO" | cut -d',' -f4)
-        CURRENT_REMOTE_IP=$(echo "$TUNNEL_INFO" | cut -d',' -f5)
-        CURRENT_MTU=$(echo "$TUNNEL_INFO" | cut -d',' -f7)
+        local tunnel_json=$(get_tunnel_by_name "$TUNNEL")
+        CURRENT_VERSION=$(echo "$tunnel_json" | jq -r '.version')
+        CURRENT_SIDE=$(echo "$tunnel_json" | jq -r '.side')
+        CURRENT_LOCAL_IP=$(echo "$tunnel_json" | jq -r '.local_ip')
+        CURRENT_REMOTE_IP=$(echo "$tunnel_json" | jq -r '.remote_ip')
+        CURRENT_MTU=$(echo "$tunnel_json" | jq -r '.mtu')
         
         # update systemd service with new configuration
         create_systemd_service "$TUNNEL" "$CURRENT_VERSION" "$CURRENT_SIDE" "$CURRENT_LOCAL_IP" "$CURRENT_REMOTE_IP" "$NEW_IP" "$CURRENT_MTU"
@@ -1090,8 +1363,8 @@ menu() {
         banner
         
         local tunnel_count=0
-        if [[ -f "$CONFIG_FILE" && -s "$CONFIG_FILE" ]]; then
-            tunnel_count=$(wc -l < "$CONFIG_FILE")
+        if [[ -f "$CONFIG_FILE" ]]; then
+            tunnel_count=$(jq -r '.tunnels | length' "$CONFIG_FILE" 2>/dev/null || echo "0")
         fi
         
         echo -e "${BOLD}${WHITE}📊 Status: ${GREEN}$tunnel_count tunnels configured${RESET}"
@@ -1144,5 +1417,11 @@ menu() {
     done
 }
 
-# main menu
+if ! check_dependencies; then
+    echo -e "${RED}❌ Failed to install required dependencies. Exiting.${RESET}" >&2
+    exit 1
+fi
+
+init_json_config
+
 menu
