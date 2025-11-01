@@ -2,6 +2,11 @@
 # GRE Tunnel Manager - IPv4 & IPv6
 # Author: Arman2122
 
+if [[ $EUID -ne 0 ]]; then
+    echo "Error: This script must be run as root (use sudo)" >&2
+    exit 1
+fi
+
 CONFIG_FILE="/etc/gre_tunnels.conf"
 AUTHOR="Arman2122"
 
@@ -117,9 +122,11 @@ if [[ "$action" == "up" ]]; then
 	fi
 
 	# Ensure address, mtu, and up state are correct (idempotent)
-	# Remove any existing addr with same prefix then add desired
-	current_prefix=$(echo "$tunnel_cidr" | cut -d'/' -f2)
-	/sbin/ip addr show dev "$tunnel" | grep -q "$(echo "$tunnel_cidr" | cut -d'/' -f1)" || /sbin/ip addr add "$tunnel_cidr" dev "$tunnel"
+	# Check if address already exists, if not add it
+	tunnel_ip=$(echo "$tunnel_cidr" | cut -d'/' -f1)
+	if ! /sbin/ip addr show dev "$tunnel" | grep -qFw "$tunnel_ip"; then
+		/sbin/ip addr add "$tunnel_cidr" dev "$tunnel"
+	fi
 	/sbin/ip link set "$tunnel" mtu "$mtu" || true
 	/sbin/ip link set "$tunnel" up
 
@@ -197,20 +204,78 @@ remove_systemd_service() {
 
 validate_ip() {
     local ip=$1
-    if [[ $ip =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
-        return 0
-    else
+    local version=$2  # optional: "4" or "6"
+    
+    if [[ -z "$version" ]]; then
+        if [[ $ip =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+            IFS='.' read -ra ADDR <<< "$ip"
+            for octet in "${ADDR[@]}"; do
+                if [[ $octet -lt 0 || $octet -gt 255 ]]; then
+                    return 1
+                fi
+            done
+            return 0
+        elif [[ $ip =~ ^([0-9a-fA-F]{0,4}:){1,7}[0-9a-fA-F]{0,4}$ ]] || [[ $ip =~ ^::1$ ]] || [[ $ip =~ ^::$ ]]; then
+            return 0
+        fi
+        return 1
+    elif [[ "$version" == "4" ]]; then
+        if [[ $ip =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+            IFS='.' read -ra ADDR <<< "$ip"
+            for octet in "${ADDR[@]}"; do
+                if [[ $octet -lt 0 || $octet -gt 255 ]]; then
+                    return 1
+                fi
+            done
+            return 0
+        fi
+        return 1
+    elif [[ "$version" == "6" ]]; then
+        if [[ $ip =~ ^([0-9a-fA-F]{0,4}:){1,7}[0-9a-fA-F]{0,4}$ ]] || [[ $ip =~ ^::1$ ]] || [[ $ip =~ ^::$ ]]; then
+            return 0
+        fi
         return 1
     fi
+    return 1
 }
 
 validate_cidr() {
     local cidr=$1
-    if [[ $cidr =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}/[0-9]{1,2}$ ]]; then
-        return 0
-    else
+    local version=$2  # optional: "4" or "6"
+    
+    if [[ -z "$version" ]]; then
+        if [[ $cidr =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}/[0-9]{1,2}$ ]]; then
+            local ip_part=$(echo "$cidr" | cut -d'/' -f1)
+            local prefix_part=$(echo "$cidr" | cut -d'/' -f2)
+            if validate_ip "$ip_part" "4" && [[ $prefix_part -ge 0 && $prefix_part -le 32 ]]; then
+                return 0
+            fi
+        elif [[ $cidr =~ ^([0-9a-fA-F]{0,4}:){1,7}[0-9a-fA-F]{0,4}/[0-9]{1,3}$ ]] || [[ $cidr =~ ^::1/[0-9]{1,3}$ ]] || [[ $cidr =~ ^::/[0-9]{1,3}$ ]]; then
+            local prefix_part=$(echo "$cidr" | cut -d'/' -f2)
+            if [[ $prefix_part -ge 0 && $prefix_part -le 128 ]]; then
+                return 0
+            fi
+        fi
+        return 1
+    elif [[ "$version" == "4" ]]; then
+        if [[ $cidr =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}/[0-9]{1,2}$ ]]; then
+            local ip_part=$(echo "$cidr" | cut -d'/' -f1)
+            local prefix_part=$(echo "$cidr" | cut -d'/' -f2)
+            if validate_ip "$ip_part" "4" && [[ $prefix_part -ge 0 && $prefix_part -le 32 ]]; then
+                return 0
+            fi
+        fi
+        return 1
+    elif [[ "$version" == "6" ]]; then
+        if [[ $cidr =~ ^([0-9a-fA-F]{0,4}:){1,7}[0-9a-fA-F]{0,4}/[0-9]{1,3}$ ]] || [[ $cidr =~ ^::1/[0-9]{1,3}$ ]] || [[ $cidr =~ ^::/[0-9]{1,3}$ ]]; then
+            local prefix_part=$(echo "$cidr" | cut -d'/' -f2)
+            if [[ $prefix_part -ge 0 && $prefix_part -le 128 ]]; then
+                return 0
+            fi
+        fi
         return 1
     fi
+    return 1
 }
 
 save_config() {
@@ -256,11 +321,27 @@ create_tunnel() {
     while true; do
         echo -e "${BOLD}${CYAN}1.${RESET} ${YELLOW}Tunnel Name:${RESET}"
         read -p "   Enter tunnel name (e.g., gre1, gre61, tunnel1): " TUNNEL
-        if [[ -n "$TUNNEL" && ! "$TUNNEL" =~ [^a-zA-Z0-9_-] ]]; then
-            break
-        else
-            echo -e "${RED}❌ Invalid tunnel name. Use only letters, numbers, hyphens, and underscores.${RESET}"
+        if [[ -z "$TUNNEL" ]]; then
+            echo -e "${RED}❌ Tunnel name cannot be empty.${RESET}"
+            continue
         fi
+        if [[ "$TUNNEL" =~ [^a-zA-Z0-9_-] ]]; then
+            echo -e "${RED}❌ Invalid tunnel name. Use only letters, numbers, hyphens, and underscores.${RESET}"
+            continue
+        fi
+        # check if tunnel name already exists
+        if [[ -f "$CONFIG_FILE" ]]; then
+            if grep -q "^$TUNNEL," "$CONFIG_FILE"; then
+                echo -e "${RED}❌ Tunnel name '$TUNNEL' already exists. Please choose a different name.${RESET}"
+                continue
+            fi
+        fi
+        # check if tunnel interface already exists
+        if ip link show "$TUNNEL" >/dev/null 2>&1; then
+            echo -e "${RED}❌ A network interface named '$TUNNEL' already exists. Please choose a different name.${RESET}"
+            continue
+        fi
+        break
     done
     echo
 
@@ -294,10 +375,14 @@ create_tunnel() {
         echo -e "${BOLD}${CYAN}4.${RESET} ${YELLOW}Local IP (Your server's public IP):${RESET}"
         echo -e "   ${DIM}💡 Use 'curl ifconfig.me' to find your public IP${RESET}"
         read -p "   Enter local IP: " LOCAL_IP
-        if validate_ip "$LOCAL_IP"; then
+        if validate_ip "$LOCAL_IP" "$VERSION"; then
             break
         else
-            echo -e "${RED}❌ Invalid IP format. Please enter a valid IPv4 address.${RESET}"
+            if [[ "$VERSION" == "6" ]]; then
+                echo -e "${RED}❌ Invalid IP format. Please enter a valid IPv6 address.${RESET}"
+            else
+                echo -e "${RED}❌ Invalid IP format. Please enter a valid IPv4 address.${RESET}"
+            fi
         fi
     done
     echo
@@ -305,10 +390,14 @@ create_tunnel() {
     while true; do
         echo -e "${BOLD}${CYAN}5.${RESET} ${YELLOW}Remote IP (Other server's public IP):${RESET}"
         read -p "   Enter remote IP: " REMOTE_IP
-        if validate_ip "$REMOTE_IP"; then
+        if validate_ip "$REMOTE_IP" "$VERSION"; then
             break
         else
-            echo -e "${RED}❌ Invalid IP format. Please enter a valid IPv4 address.${RESET}"
+            if [[ "$VERSION" == "6" ]]; then
+                echo -e "${RED}❌ Invalid IP format. Please enter a valid IPv6 address.${RESET}"
+            else
+                echo -e "${RED}❌ Invalid IP format. Please enter a valid IPv4 address.${RESET}"
+            fi
         fi
     done
     echo
@@ -345,13 +434,21 @@ create_tunnel() {
             # Manual tunnel IP input
             while true; do
                 echo -e "   ${YELLOW}Manual Tunnel IP Input:${RESET}"
-                echo -e "   ${DIM}Examples: 10.10.10.1/30, 192.168.1.1/30, 172.16.1.1/24${RESET}"
+                if [[ "$VERSION" == "6" ]]; then
+                    echo -e "   ${DIM}Examples for IPv6: 2001:db8::1/64, fc00::1/64${RESET}"
+                else
+                    echo -e "   ${DIM}Examples for IPv4: 10.10.10.1/30, 192.168.1.1/30, 172.16.1.1/24${RESET}"
+                fi
                 read -p "   Enter tunnel IP with subnet: " TUNNEL_IP
-                if validate_cidr "$TUNNEL_IP"; then
+                if validate_cidr "$TUNNEL_IP" "$VERSION"; then
                     echo -e "   ${GREEN}✓${RESET} Manual input: ${BOLD}${GREEN}$TUNNEL_IP${RESET}"
                     break
                 else
-                    echo -e "   ${RED}❌ Invalid CIDR format. Please use format like 10.10.10.1/30${RESET}"
+                    if [[ "$VERSION" == "6" ]]; then
+                        echo -e "   ${RED}❌ Invalid IPv6 CIDR format. Please use format like 2001:db8::1/64${RESET}"
+                    else
+                        echo -e "   ${RED}❌ Invalid IPv4 CIDR format. Please use format like 10.10.10.1/30${RESET}"
+                    fi
                 fi
             done
             ;;
@@ -556,10 +653,14 @@ change_tunnel_ip() {
         fi
         
         read -p "   Enter new tunnel IP: " NEW_IP
-        if validate_cidr "$NEW_IP"; then
+        if validate_cidr "$NEW_IP" "$CURRENT_VERSION"; then
             break
         else
-            echo -e "${RED}❌ Invalid CIDR format. Please use format like 10.10.10.1/30${RESET}"
+            if [[ "$CURRENT_VERSION" == "6" ]]; then
+                echo -e "${RED}❌ Invalid IPv6 CIDR format. Please use format like 2001:db8::1/64${RESET}"
+            else
+                echo -e "${RED}❌ Invalid IPv4 CIDR format. Please use format like 10.10.10.1/30${RESET}"
+            fi
         fi
     done
     echo
@@ -578,12 +679,24 @@ change_tunnel_ip() {
         echo -e "${BOLD}${BLUE}🔧 Updating tunnel IP...${RESET}"
         
         ip addr del $OLD_IP dev $TUNNEL 2>/dev/null
-    ip addr add $NEW_IP dev $TUNNEL
+        ip addr add $NEW_IP dev $TUNNEL
 
-    sed -i "s#$OLD_IP#$NEW_IP#g" "$CONFIG_FILE"
+        # update config file
+        sed -i "s#$OLD_IP#$NEW_IP#g" "$CONFIG_FILE"
+        
+        TUNNEL_INFO=$(grep "^$TUNNEL," "$CONFIG_FILE")
+        CURRENT_VERSION=$(echo "$TUNNEL_INFO" | cut -d',' -f2)
+        CURRENT_SIDE=$(echo "$TUNNEL_INFO" | cut -d',' -f3)
+        CURRENT_LOCAL_IP=$(echo "$TUNNEL_INFO" | cut -d',' -f4)
+        CURRENT_REMOTE_IP=$(echo "$TUNNEL_INFO" | cut -d',' -f5)
+        CURRENT_MTU=$(echo "$TUNNEL_INFO" | cut -d',' -f7)
+        
+        # update systemd service with new configuration
+        create_systemd_service "$TUNNEL" "$CURRENT_VERSION" "$CURRENT_SIDE" "$CURRENT_LOCAL_IP" "$CURRENT_REMOTE_IP" "$NEW_IP" "$CURRENT_MTU"
 
         echo -e "${BOLD}${GREEN}✅ Tunnel $TUNNEL IP updated successfully!${RESET}"
         echo -e "${GREEN}🔗 New IP: $NEW_IP${RESET}"
+        echo -e "${GREEN}🔧 Systemd service updated and reloaded.${RESET}"
     else
         echo -e "${YELLOW}❌ IP change cancelled.${RESET}"
     fi
