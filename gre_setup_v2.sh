@@ -234,6 +234,89 @@ update_tunnel_ip_in_json() {
     mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
 }
 
+get_next_auto_tunnel_ip() {
+    local version="$1"
+    local side="$2"
+    
+    if [[ "$version" == "4" ]]; then
+        local used_subnets=()
+        
+        if [[ -f "$CONFIG_FILE" ]]; then
+            while IFS= read -r tunnel_json; do
+                [[ -z "$tunnel_json" ]] && continue
+                local tunnel_ip=$(echo "$tunnel_json" | jq -r '.tunnel_ip')
+                local tunnel_version=$(echo "$tunnel_json" | jq -r '.version')
+                
+                if [[ "$tunnel_version" == "4" ]] && [[ "$tunnel_ip" =~ ^10\.10\.([0-9]+)\.[12]/30$ ]]; then
+                    local subnet_octet="${BASH_REMATCH[1]}"
+                    if [[ ! " ${used_subnets[@]} " =~ " ${subnet_octet} " ]]; then
+                        used_subnets+=("$subnet_octet")
+                    fi
+                fi
+            done < <(get_all_tunnels)
+        fi
+        
+        local next_subnet=10
+        
+        if [[ ${#used_subnets[@]} -gt 0 ]]; then
+            IFS=$'\n' sorted=($(sort -n <<<"${used_subnets[*]}"))
+            unset IFS
+            
+            for subnet in "${sorted[@]}"; do
+                if [[ $subnet -eq $next_subnet ]]; then
+                    next_subnet=$((subnet + 10))
+                elif [[ $subnet -gt $next_subnet ]]; then
+                    break
+                fi
+            done
+        fi
+        
+        if [[ "$side" == "iran" ]]; then
+            echo "10.10.$next_subnet.1/30"
+        else
+            echo "10.10.$next_subnet.2/30"
+        fi
+    else
+        local used_subnets=()
+        
+        if [[ -f "$CONFIG_FILE" ]]; then
+            while IFS= read -r tunnel_json; do
+                [[ -z "$tunnel_json" ]] && continue
+                local tunnel_ip=$(echo "$tunnel_json" | jq -r '.tunnel_ip')
+                local tunnel_version=$(echo "$tunnel_json" | jq -r '.version')
+                
+                if [[ "$tunnel_version" == "6" ]] && [[ "$tunnel_ip" =~ ^10\.10\.([0-9]+)\.[12]/24$ ]]; then
+                    local subnet_octet="${BASH_REMATCH[1]}"
+                    if [[ ! " ${used_subnets[@]} " =~ " ${subnet_octet} " ]]; then
+                        used_subnets+=("$subnet_octet")
+                    fi
+                fi
+            done < <(get_all_tunnels)
+        fi
+        
+        local next_subnet=10
+        
+        if [[ ${#used_subnets[@]} -gt 0 ]]; then
+            IFS=$'\n' sorted=($(sort -n <<<"${used_subnets[*]}"))
+            unset IFS
+            
+            for subnet in "${sorted[@]}"; do
+                if [[ $subnet -eq $next_subnet ]]; then
+                    next_subnet=$((subnet + 10))
+                elif [[ $subnet -gt $next_subnet ]]; then
+                    break
+                fi
+            done
+        fi
+        
+        if [[ "$side" == "iran" ]]; then
+            echo "10.10.$next_subnet.2/24"
+        else
+            echo "10.10.$next_subnet.1/24"
+        fi
+    fi
+}
+
 banner() {
     clear
     echo -e "${BOLD}${CYAN}╔══════════════════════════════════════════════════════════════╗${RESET}"
@@ -1024,29 +1107,23 @@ create_tunnel() {
     
     case $ip_choice in
         1)
+            TUNNEL_IP=$(get_next_auto_tunnel_ip "$VERSION" "$SIDE")
             if [[ "$VERSION" == "4" ]]; then
-                # IPv4 GRE tunnel - use /30 subnet
                 if [[ "$SIDE" == "iran" ]]; then
-                    TUNNEL_IP="10.10.10.1/30"
                     echo -e "   ${GREEN}✓${RESET} Auto-assigned: ${BOLD}${GREEN}$TUNNEL_IP${RESET} (Iran server - IPv4 GRE)"
                 else
-                    TUNNEL_IP="10.10.10.2/30"
                     echo -e "   ${GREEN}✓${RESET} Auto-assigned: ${BOLD}${GREEN}$TUNNEL_IP${RESET} (External server - IPv4 GRE)"
                 fi
             else
-                # IPv6 GRE tunnel - use /24 subnet
                 if [[ "$SIDE" == "iran" ]]; then
-                    TUNNEL_IP="10.10.10.2/24"
                     echo -e "   ${GREEN}✓${RESET} Auto-assigned: ${BOLD}${GREEN}$TUNNEL_IP${RESET} (Iran server - IPv6 GRE)"
                 else
-                    TUNNEL_IP="10.10.10.1/24"
                     echo -e "   ${GREEN}✓${RESET} Auto-assigned: ${BOLD}${GREEN}$TUNNEL_IP${RESET} (External server - IPv6 GRE)"
                 fi
             fi
-            echo -e "   ${DIM}💡 This follows the standard GRE tunnel configuration pattern${RESET}"
+            echo -e "   ${DIM}💡 Smart assignment: Automatically detects next available subnet${RESET}"
             ;;
         2)
-            # Manual tunnel IP input
             while true; do
                 echo -e "   ${YELLOW}Manual Tunnel IP Input:${RESET}"
                 if [[ "$VERSION" == "6" ]]; then
@@ -1069,19 +1146,7 @@ create_tunnel() {
             ;;
         *)
             echo -e "   ${RED}❌ Invalid choice. Using auto-assign as default.${RESET}"
-            if [[ "$VERSION" == "4" ]]; then
-                if [[ "$SIDE" == "iran" ]]; then
-                    TUNNEL_IP="10.10.10.1/30"
-                else
-                    TUNNEL_IP="10.10.10.2/30"
-                fi
-            else
-                if [[ "$SIDE" == "iran" ]]; then
-                    TUNNEL_IP="10.10.10.2/24"
-                else
-                    TUNNEL_IP="10.10.10.1/24"
-                fi
-            fi
+            TUNNEL_IP=$(get_next_auto_tunnel_ip "$VERSION" "$SIDE")
             echo -e "   ${GREEN}✓${RESET} Auto-assigned: ${BOLD}${GREEN}$TUNNEL_IP${RESET}"
             ;;
     esac
