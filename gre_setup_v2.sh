@@ -308,6 +308,219 @@ list_tunnels() {
     echo
 }
 
+show_tunnel_status() {
+    banner
+    echo -e "${BOLD}${CYAN}📊 Tunnel Status & Details${RESET}"
+    echo -e "${DIM}─────────────────────────────────────────────────────────────${RESET}"
+    echo
+
+    if [[ ! -f "$CONFIG_FILE" || ! -s "$CONFIG_FILE" ]]; then
+        echo -e "${YELLOW}⚠️  No tunnels configured yet.${RESET}"
+        echo
+        return
+    fi
+
+    # show all tunnels status overview
+    echo -e "${BOLD}${YELLOW}📋 All Tunnels Overview:${RESET}"
+    echo -e "${DIM}┌─────────────────────────────────────────────────────────────┐${RESET}"
+    
+    local count=0
+    local tunnels=()
+    while IFS=',' read -r tunnel version side local_ip remote_ip tunnel_ip mtu; do
+        ((count++))
+        tunnels+=("$tunnel")
+        
+        # check if interface exists
+        if ip link show "$tunnel" >/dev/null 2>&1; then
+            local state=$(ip link show "$tunnel" | grep -o 'state [A-Z]*' | awk '{print $2}' | head -1)
+            if [[ "$state" == "UP" ]]; then
+                local status_icon="${GREEN}✓${RESET}"
+                local status_text="${GREEN}UP${RESET}"
+            else
+                local status_icon="${RED}✗${RESET}"
+                local status_text="${RED}DOWN${RESET}"
+            fi
+        else
+            local status_icon="${RED}✗${RESET}"
+            local status_text="${RED}NOT FOUND${RESET}"
+            local state="N/A"
+        fi
+        
+        # check systemd service status
+        local unit_name="${SERVICE_PREFIX}${tunnel}.service"
+        local svc_status="N/A"
+        if systemctl list-units --all | grep -q "${unit_name}"; then
+            if systemctl is-active --quiet "${unit_name}" 2>/dev/null; then
+                svc_status="${GREEN}active${RESET}"
+            elif systemctl is-enabled --quiet "${unit_name}" 2>/dev/null; then
+                svc_status="${YELLOW}enabled${RESET}"
+            else
+                svc_status="${RED}inactive${RESET}"
+            fi
+        fi
+        
+        echo -e "${DIM}│${RESET} ${status_icon} ${BOLD}${CYAN}[$count]${RESET} ${CYAN}$tunnel${RESET}"
+        echo -e "${DIM}│${RESET}    ${DIM}Status:${RESET} $status_text | ${DIM}Service:${RESET} $svc_status"
+        echo -e "${DIM}│${RESET}"
+    done < "$CONFIG_FILE"
+    
+    echo -e "${DIM}└─────────────────────────────────────────────────────────────┘${RESET}"
+    echo
+
+    # detailed view option
+    if [[ $count -eq 0 ]]; then
+        return
+    fi
+
+    echo -e "${BOLD}${YELLOW}Select tunnel for detailed status:${RESET}"
+    echo -e "${DIM}Enter tunnel number [1-$count] or 'a' for all, '0' to skip:${RESET}"
+    read -p "   Your choice: " selection
+
+    if [[ "$selection" == "0" ]]; then
+        return
+    fi
+
+    if [[ "$selection" == "a" || "$selection" == "A" ]]; then
+        # show all tunnels in detail
+        local idx=0
+        while IFS=',' read -r tunnel version side local_ip remote_ip tunnel_ip mtu; do
+            ((idx++))
+            show_detailed_tunnel_status "$tunnel" "$version" "$side" "$local_ip" "$remote_ip" "$tunnel_ip" "$mtu"
+            if [[ $idx -lt $count ]]; then
+                echo
+                echo -e "${DIM}─────────────────────────────────────────────────────────────${RESET}"
+                echo
+            fi
+        done < "$CONFIG_FILE"
+    elif [[ "$selection" =~ ^[0-9]+$ ]]; then
+        if [[ $selection -ge 1 && $selection -le $count ]]; then
+            TUNNEL="${tunnels[$((selection-1))]}"
+            TUNNEL_INFO=$(grep "^$TUNNEL," "$CONFIG_FILE")
+            if [[ -n "$TUNNEL_INFO" ]]; then
+                CURRENT_VERSION=$(echo "$TUNNEL_INFO" | cut -d',' -f2)
+                CURRENT_SIDE=$(echo "$TUNNEL_INFO" | cut -d',' -f3)
+                CURRENT_LOCAL_IP=$(echo "$TUNNEL_INFO" | cut -d',' -f4)
+                CURRENT_REMOTE_IP=$(echo "$TUNNEL_INFO" | cut -d',' -f5)
+                CURRENT_TUNNEL_IP=$(echo "$TUNNEL_INFO" | cut -d',' -f6)
+                CURRENT_MTU=$(echo "$TUNNEL_INFO" | cut -d',' -f7)
+                
+                show_detailed_tunnel_status "$TUNNEL" "$CURRENT_VERSION" "$CURRENT_SIDE" "$CURRENT_LOCAL_IP" "$CURRENT_REMOTE_IP" "$CURRENT_TUNNEL_IP" "$CURRENT_MTU"
+            fi
+        else
+            echo -e "${RED}❌ Invalid selection.${RESET}"
+        fi
+    else
+        echo -e "${RED}❌ Invalid selection.${RESET}"
+    fi
+    echo
+}
+
+show_detailed_tunnel_status() {
+    local tunnel="$1"
+    local version="$2"
+    local side="$3"
+    local local_ip="$4"
+    local remote_ip="$5"
+    local tunnel_ip="$6"
+    local mtu="$7"
+
+    echo -e "${BOLD}${CYAN}🔍 Detailed Status: ${WHITE}$tunnel${RESET}"
+    echo -e "${DIM}┌─────────────────────────────────────────────────────────────┐${RESET}"
+    
+    # configuration info
+    echo -e "${DIM}│${RESET} ${BOLD}${YELLOW}Configuration:${RESET}"
+    echo -e "${DIM}│${RESET}   ${GREEN}•${RESET} Type: IPv$version GRE"
+    echo -e "${DIM}│${RESET}   ${GREEN}•${RESET} Side: $side"
+    echo -e "${DIM}│${RESET}   ${GREEN}•${RESET} Local IP: $local_ip"
+    echo -e "${DIM}│${RESET}   ${GREEN}•${RESET} Remote IP: $remote_ip"
+    echo -e "${DIM}│${RESET}   ${GREEN}•${RESET} Tunnel IP: $tunnel_ip"
+    echo -e "${DIM}│${RESET}   ${GREEN}•${RESET} MTU: $mtu"
+    echo -e "${DIM}│${RESET}"
+    
+    # interface status
+    echo -e "${DIM}│${RESET} ${BOLD}${YELLOW}Interface Status:${RESET}"
+    if ip link show "$tunnel" >/dev/null 2>&1; then
+        local state=$(ip link show "$tunnel" | grep -o 'state [A-Z]*' | awk '{print $2}' | head -1)
+        local mtu_actual=$(ip link show "$tunnel" | grep -o 'mtu [0-9]*' | awk '{print $2}' | head -1)
+        
+        if [[ "$state" == "UP" ]]; then
+            echo -e "${DIM}│${RESET}   ${GREEN}✓${RESET} Interface exists and is ${GREEN}UP${RESET}"
+        else
+            echo -e "${DIM}│${RESET}   ${RED}✗${RESET} Interface exists but is ${RED}DOWN${RESET}"
+        fi
+        echo -e "${DIM}│${RESET}   ${GREEN}•${RESET} Current MTU: $mtu_actual"
+        
+        local ip_info=$(ip addr show dev "$tunnel" 2>/dev/null | grep "inet" | head -1)
+        if [[ -n "$ip_info" ]]; then
+            local current_ip=$(echo "$ip_info" | awk '{print $2}')
+            echo -e "${DIM}│${RESET}   ${GREEN}•${RESET} Current IP: $current_ip"
+            if [[ "$current_ip" != "$tunnel_ip" ]]; then
+                echo -e "${DIM}│${RESET}   ${YELLOW}⚠${RESET} IP mismatch! Config: $tunnel_ip"
+            fi
+        else
+            echo -e "${DIM}│${RESET}   ${RED}✗${RESET} No IP address assigned"
+        fi
+        
+        if [[ "$version" == "6" ]]; then
+            local remote_peer=$(ip -6 tunnel show "$tunnel" 2>/dev/null | grep -o 'remote [0-9a-fA-F:.]*' | awk '{print $2}' | head -1)
+        else
+            local remote_peer=$(ip tunnel show "$tunnel" 2>/dev/null | grep -o 'remote [0-9.]*' | awk '{print $2}' | head -1)
+        fi
+        if [[ -n "$remote_peer" ]]; then
+            echo -e "${DIM}│${RESET}   ${GREEN}•${RESET} Remote peer: $remote_peer"
+            if [[ "$remote_peer" != "$remote_ip" ]]; then
+                echo -e "${DIM}│${RESET}   ${YELLOW}⚠${RESET} Remote IP mismatch! Config: $remote_ip"
+            fi
+        fi
+        
+        # traffic statistics
+        local rx_bytes=$(ip -s link show "$tunnel" 2>/dev/null | grep -A1 "RX:" | tail -1 | awk '{print $1}')
+        local tx_bytes=$(ip -s link show "$tunnel" 2>/dev/null | grep -A1 "TX:" | tail -1 | awk '{print $1}')
+        if [[ -n "$rx_bytes" && -n "$tx_bytes" ]]; then
+            echo -e "${DIM}│${RESET}"
+            echo -e "${DIM}│${RESET} ${BOLD}${YELLOW}Traffic Statistics:${RESET}"
+            echo -e "${DIM}│${RESET}   ${GREEN}•${RESET} RX Bytes: $(numfmt --to=iec-i --suffix=B "$rx_bytes" 2>/dev/null || echo "$rx_bytes")"
+            echo -e "${DIM}│${RESET}   ${GREEN}•${RESET} TX Bytes: $(numfmt --to=iec-i --suffix=B "$tx_bytes" 2>/dev/null || echo "$tx_bytes")"
+        fi
+    else
+        echo -e "${DIM}│${RESET}   ${RED}✗${RESET} Interface ${RED}NOT FOUND${RESET}"
+        echo -e "${DIM}│${RESET}   ${YELLOW}⚠${RESET} Tunnel interface does not exist"
+    fi
+    echo -e "${DIM}│${RESET}"
+    
+    # systemd service status
+    echo -e "${DIM}│${RESET} ${BOLD}${YELLOW}Systemd Service:${RESET}"
+    local unit_name="${SERVICE_PREFIX}${tunnel}.service"
+    if systemctl list-units --all | grep -q "${unit_name}"; then
+        local svc_active=$(systemctl is-active "${unit_name}" 2>/dev/null || echo "inactive")
+        local svc_enabled=$(systemctl is-enabled "${unit_name}" 2>/dev/null || echo "disabled")
+        
+        if [[ "$svc_active" == "active" ]]; then
+            echo -e "${DIM}│${RESET}   ${GREEN}✓${RESET} Service is ${GREEN}active${RESET}"
+        else
+            echo -e "${DIM}│${RESET}   ${RED}✗${RESET} Service is ${RED}inactive${RESET}"
+        fi
+        
+        if [[ "$svc_enabled" == "enabled" ]]; then
+            echo -e "${DIM}│${RESET}   ${GREEN}✓${RESET} Service is ${GREEN}enabled${RESET} (auto-start on boot)"
+        else
+            echo -e "${DIM}│${RESET}   ${YELLOW}⚠${RESET} Service is ${YELLOW}disabled${RESET} (will not start on boot)"
+        fi
+        
+        if [[ "$svc_active" != "active" ]]; then
+            local svc_status=$(systemctl status "${unit_name}" --no-pager -n 0 2>/dev/null | tail -1)
+            if [[ -n "$svc_status" ]]; then
+                echo -e "${DIM}│${RESET}   ${DIM}Status: $svc_status${RESET}"
+            fi
+        fi
+    else
+        echo -e "${DIM}│${RESET}   ${RED}✗${RESET} Systemd service ${RED}NOT FOUND${RESET}"
+        echo -e "${DIM}│${RESET}   ${YELLOW}⚠${RESET} No systemd service configured for this tunnel"
+    fi
+    
+    echo -e "${DIM}└─────────────────────────────────────────────────────────────┘${RESET}"
+}
+
 create_tunnel() {
     banner
     echo -e "${BOLD}${GREEN}🚀 Create a new GRE Tunnel${RESET}"
@@ -722,19 +935,21 @@ menu() {
         echo -e "${DIM}│${RESET} ${BOLD}${CYAN}[2]${RESET} ${RED}🗑️  Delete Tunnel${RESET}          ${DIM}Remove an existing tunnel${RESET}"
         echo -e "${DIM}│${RESET} ${BOLD}${CYAN}[3]${RESET} ${BLUE}🔄 Change Tunnel IP${RESET}        ${DIM}Modify tunnel IP address${RESET}"
         echo -e "${DIM}│${RESET} ${BOLD}${CYAN}[4]${RESET} ${YELLOW}📋 List Tunnels${RESET}           ${DIM}View all configured tunnels${RESET}"
-        echo -e "${DIM}│${RESET} ${BOLD}${CYAN}[5]${RESET} ${MAGENTA}❓ Show Help${RESET}              ${DIM}Display help and examples${RESET}"
+        echo -e "${DIM}│${RESET} ${BOLD}${CYAN}[5]${RESET} ${CYAN}📊 Tunnel Status${RESET}          ${DIM}Check tunnel status and details${RESET}"
+        echo -e "${DIM}│${RESET} ${BOLD}${CYAN}[6]${RESET} ${MAGENTA}❓ Show Help${RESET}              ${DIM}Display help and examples${RESET}"
         echo -e "${DIM}│${RESET} ${BOLD}${CYAN}[0]${RESET} ${WHITE}🚪 Exit${RESET}                  ${DIM}Exit the program${RESET}"
         echo -e "${DIM}└─────────────────────────────────────────────────────────────┘${RESET}"
         echo
         
-        read -p "Choose an option [0-5]: " choice
+        read -p "Choose an option [0-6]: " choice
 
         case $choice in
             1) create_tunnel ;;
             2) delete_tunnel ;;
             3) change_tunnel_ip ;;
             4) list_tunnels ;;
-            5) 
+            5) show_tunnel_status ;;
+            6) 
                 banner
                 show_help
                 get_network_interfaces
@@ -748,12 +963,12 @@ menu() {
                 exit 0 
                 ;;
             *) 
-                echo -e "${BOLD}${RED}❌ Invalid choice! Please select 0-5.${RESET}"
+                echo -e "${BOLD}${RED}❌ Invalid choice! Please select 0-6.${RESET}"
                 echo
                 ;;
         esac
 
-        if [[ "$choice" != "5" ]]; then
+        if [[ "$choice" != "6" ]]; then
             echo -e "${DIM}Press Enter to continue...${RESET}"
             read
         fi
