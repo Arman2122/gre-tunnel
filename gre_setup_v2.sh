@@ -282,6 +282,27 @@ save_config() {
     echo "$1" >> "$CONFIG_FILE"
 }
 
+check_tunnel_status() {
+    local tunnel="$1"
+    
+    if ! ip link show "$tunnel" >/dev/null 2>&1; then
+        echo "NOT_FOUND"
+        return
+    fi
+
+    local link_output=$(ip link show "$tunnel" 2>/dev/null)
+    
+    if echo "$link_output" | grep -qE '<.*(UP|LOWER_UP).*>'; then
+        if ip addr show dev "$tunnel" 2>/dev/null | grep -q "inet"; then
+            echo "UP"
+        else
+            echo "UP_NO_IP"
+        fi
+    else
+        echo "DOWN"
+    fi
+}
+
 list_tunnels() {
     banner
     echo -e "${BOLD}${YELLOW}📋 Configured Tunnels:${RESET}"
@@ -330,21 +351,25 @@ show_tunnel_status() {
         ((count++))
         tunnels+=("$tunnel")
         
-        # check if interface exists
-        if ip link show "$tunnel" >/dev/null 2>&1; then
-            local state=$(ip link show "$tunnel" | grep -o 'state [A-Z]*' | awk '{print $2}' | head -1)
-            if [[ "$state" == "UP" ]]; then
+        local tunnel_status=$(check_tunnel_status "$tunnel")
+        case "$tunnel_status" in
+            "UP")
                 local status_icon="${GREEN}✓${RESET}"
-                local status_text="${GREEN}UP${RESET}"
-            else
+                local status_text="${GREEN}UP & WORKING${RESET}"
+                ;;
+            "UP_NO_IP")
+                local status_icon="${YELLOW}⚠${RESET}"
+                local status_text="${YELLOW}UP (no IP)${RESET}"
+                ;;
+            "DOWN")
                 local status_icon="${RED}✗${RESET}"
                 local status_text="${RED}DOWN${RESET}"
-            fi
-        else
-            local status_icon="${RED}✗${RESET}"
-            local status_text="${RED}NOT FOUND${RESET}"
-            local state="N/A"
-        fi
+                ;;
+            "NOT_FOUND")
+                local status_icon="${RED}✗${RESET}"
+                local status_text="${RED}NOT FOUND${RESET}"
+                ;;
+        esac
         
         # check systemd service status
         local unit_name="${SERVICE_PREFIX}${tunnel}.service"
@@ -439,15 +464,25 @@ show_detailed_tunnel_status() {
     
     # interface status
     echo -e "${DIM}│${RESET} ${BOLD}${YELLOW}Interface Status:${RESET}"
-    if ip link show "$tunnel" >/dev/null 2>&1; then
-        local state=$(ip link show "$tunnel" | grep -o 'state [A-Z]*' | awk '{print $2}' | head -1)
+    local tunnel_status=$(check_tunnel_status "$tunnel")
+    if [[ "$tunnel_status" != "NOT_FOUND" ]]; then
         local mtu_actual=$(ip link show "$tunnel" | grep -o 'mtu [0-9]*' | awk '{print $2}' | head -1)
+        local state_raw=$(ip link show "$tunnel" | grep -o 'state [A-Z]*' | awk '{print $2}' | head -1)
         
-        if [[ "$state" == "UP" ]]; then
-            echo -e "${DIM}│${RESET}   ${GREEN}✓${RESET} Interface exists and is ${GREEN}UP${RESET}"
-        else
-            echo -e "${DIM}│${RESET}   ${RED}✗${RESET} Interface exists but is ${RED}DOWN${RESET}"
-        fi
+        case "$tunnel_status" in
+            "UP")
+                echo -e "${DIM}│${RESET}   ${GREEN}✓${RESET} Interface is ${GREEN}UP & WORKING${RESET}"
+                echo -e "${DIM}│${RESET}   ${GREEN}•${RESET} Interface state: $state_raw (normal for GRE tunnels)"
+                ;;
+            "UP_NO_IP")
+                echo -e "${DIM}│${RESET}   ${YELLOW}⚠${RESET} Interface is UP but ${YELLOW}no IP assigned${RESET}"
+                echo -e "${DIM}│${RESET}   ${GREEN}•${RESET} Interface state: $state_raw"
+                ;;
+            "DOWN")
+                echo -e "${DIM}│${RESET}   ${RED}✗${RESET} Interface exists but is ${RED}DOWN${RESET}"
+                echo -e "${DIM}│${RESET}   ${GREEN}•${RESET} Interface state: $state_raw"
+                ;;
+        esac
         echo -e "${DIM}│${RESET}   ${GREEN}•${RESET} Current MTU: $mtu_actual"
         
         local ip_info=$(ip addr show dev "$tunnel" 2>/dev/null | grep "inet" | head -1)
@@ -479,8 +514,32 @@ show_detailed_tunnel_status() {
         if [[ -n "$rx_bytes" && -n "$tx_bytes" ]]; then
             echo -e "${DIM}│${RESET}"
             echo -e "${DIM}│${RESET} ${BOLD}${YELLOW}Traffic Statistics:${RESET}"
-            echo -e "${DIM}│${RESET}   ${GREEN}•${RESET} RX Bytes: $(numfmt --to=iec-i --suffix=B "$rx_bytes" 2>/dev/null || echo "$rx_bytes")"
-            echo -e "${DIM}│${RESET}   ${GREEN}•${RESET} TX Bytes: $(numfmt --to=iec-i --suffix=B "$tx_bytes" 2>/dev/null || echo "$tx_bytes")"
+            local rx_formatted=$(numfmt --to=iec-i --suffix=B "$rx_bytes" 2>/dev/null || echo "${rx_bytes} bytes")
+            local tx_formatted=$(numfmt --to=iec-i --suffix=B "$tx_bytes" 2>/dev/null || echo "${tx_bytes} bytes")
+            echo -e "${DIM}│${RESET}   ${GREEN}•${RESET} RX Bytes: $rx_formatted"
+            echo -e "${DIM}│${RESET}   ${GREEN}•${RESET} TX Bytes: $tx_formatted"
+            
+            if [[ "$rx_bytes" -gt 0 ]] || [[ "$tx_bytes" -gt 0 ]]; then
+                echo -e "${DIM}│${RESET}   ${GREEN}✓${RESET} Traffic detected - tunnel appears ${GREEN}operational${RESET}"
+            fi
+        fi
+        
+        if [[ "$tunnel_status" == "UP" ]]; then
+            local tunnel_ip_only=$(echo "$tunnel_ip" | cut -d'/' -f1)
+            if [[ "$version" == "4" ]]; then
+                local ip_octets=($(echo "$tunnel_ip_only" | tr '.' ' '))
+                if [[ "${ip_octets[3]}" == "1" ]]; then
+                    local remote_tunnel_ip="${ip_octets[0]}.${ip_octets[1]}.${ip_octets[2]}.2"
+                else
+                    local remote_tunnel_ip="${ip_octets[0]}.${ip_octets[1]}.${ip_octets[2]}.1"
+                fi
+                
+                if ping -c 1 -W 2 "$remote_tunnel_ip" >/dev/null 2>&1; then
+                    echo -e "${DIM}│${RESET}"
+                    echo -e "${DIM}│${RESET} ${BOLD}${YELLOW}Connectivity Test:${RESET}"
+                    echo -e "${DIM}│${RESET}   ${GREEN}✓${RESET} Ping successful to remote tunnel IP (${GREEN}$remote_tunnel_ip${RESET})"
+                fi
+            fi
         fi
     else
         echo -e "${DIM}│${RESET}   ${RED}✗${RESET} Interface ${RED}NOT FOUND${RESET}"
