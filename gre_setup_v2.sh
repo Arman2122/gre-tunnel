@@ -282,6 +282,55 @@ save_config() {
     echo "$1" >> "$CONFIG_FILE"
 }
 
+# validate MTU value
+validate_mtu() {
+    local mtu=$1
+    local show_tips=${2:-true}
+    
+    if ! [[ "$mtu" =~ ^[0-9]+$ ]]; then
+        echo -e "${RED}❌ Invalid MTU. Must be a number.${RESET}"
+        return 1
+    fi
+    
+    # check absolute limits (Linux kernel supports 68-9000)
+    if [[ $mtu -lt 68 ]]; then
+        echo -e "${RED}❌ MTU too low! Minimum is 68 bytes.${RESET}"
+        echo -e "${YELLOW}   💡 MTU below 68 is not supported by Linux kernel.${RESET}"
+        return 1
+    fi
+    
+    if [[ $mtu -gt 9000 ]]; then
+        echo -e "${RED}❌ MTU too high! Maximum is 9000 bytes (jumbo frames).${RESET}"
+        echo -e "${YELLOW}   💡 Most network equipment doesn't support MTU above 9000.${RESET}"
+        return 1
+    fi
+    
+    if [[ "$show_tips" == "true" ]]; then
+        if [[ $mtu -lt 576 ]]; then
+            echo -e "${YELLOW}⚠️  Very low MTU detected ($mtu bytes)${RESET}"
+            echo -e "${YELLOW}   💡 Standard minimum IP MTU is 576 bytes. Lower values may cause:${RESET}"
+            echo -e "${YELLOW}      • Excessive packet fragmentation${RESET}"
+            echo -e "${YELLOW}      • Reduced network efficiency${RESET}"
+            echo -e "${YELLOW}      • Performance degradation${RESET}"
+        elif [[ $mtu -ge 576 && $mtu -lt 1200 ]]; then
+            echo -e "${YELLOW}⚠️  Low MTU value ($mtu bytes)${RESET}"
+            echo -e "${YELLOW}   💡 Consider using MTU between 1200-1500 for better performance.${RESET}"
+            echo -e "${YELLOW}      Standard MTU for GRE tunnels is 1470 (recommended).${RESET}"
+        elif [[ $mtu -gt 1500 && $mtu -le 9000 ]]; then
+            echo -e "${YELLOW}⚠️  High MTU value ($mtu bytes)${RESET}"
+            echo -e "${YELLOW}   💡 MTU above 1500 requires jumbo frame support:${RESET}"
+            echo -e "${YELLOW}      • All network devices in path must support jumbo frames${RESET}"
+            echo -e "${YELLOW}      • Standard Ethernet MTU is 1500 bytes${RESET}"
+            echo -e "${YELLOW}      • May cause fragmentation if not supported${RESET}"
+            if [[ $mtu -gt 1500 && $mtu -lt 9000 ]]; then
+                echo -e "${YELLOW}      • Ensure remote peer and all intermediate devices support this MTU${RESET}"
+            fi
+        fi
+    fi
+    
+    return 0
+}
+
 check_tunnel_status() {
     local tunnel="$1"
     
@@ -792,11 +841,24 @@ create_tunnel() {
     esac
     echo
 
-    echo -e "${BOLD}${CYAN}7.${RESET} ${YELLOW}MTU (Maximum Transmission Unit):${RESET}"
-    echo -e "   ${DIM}Default: 1470 (recommended for GRE tunnels)${RESET}"
-    read -p "   Enter MTU [1470]: " MTU
-    MTU=${MTU:-1470}
-    echo
+    # MTU with validation
+    while true; do
+        echo -e "${BOLD}${CYAN}7.${RESET} ${YELLOW}MTU (Maximum Transmission Unit):${RESET}"
+        echo -e "   ${DIM}Default: 1470 (recommended for GRE tunnels)${RESET}"
+        echo -e "   ${DIM}Valid range: 68-9000 bytes${RESET}"
+        read -p "   Enter MTU [1470]: " MTU
+        MTU=${MTU:-1470}
+        
+        # validate MTU
+        if validate_mtu "$MTU" "true"; then
+            echo
+            break
+        else
+            echo
+            echo -e "${RED}Please enter a valid MTU value.${RESET}"
+            echo
+        fi
+    done
 
     # confirmation
     echo -e "${BOLD}${MAGENTA}📋 Configuration Summary:${RESET}"
