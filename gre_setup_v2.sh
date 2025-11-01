@@ -303,6 +303,45 @@ check_tunnel_status() {
     fi
 }
 
+# get ping
+get_ping_time() {
+    local tunnel_ip="$1"
+    local version="$2"
+    
+    if [[ "$version" != "4" ]]; then
+        echo ""
+        return
+    fi
+    
+    local tunnel_ip_only=$(echo "$tunnel_ip" | cut -d'/' -f1)
+    local ip_octets=($(echo "$tunnel_ip_only" | tr '.' ' '))
+    local remote_tunnel_ip=""
+    
+    if [[ "${ip_octets[3]}" == "1" ]]; then
+        remote_tunnel_ip="${ip_octets[0]}.${ip_octets[1]}.${ip_octets[2]}.2"
+    else
+        remote_tunnel_ip="${ip_octets[0]}.${ip_octets[1]}.${ip_octets[2]}.1"
+    fi
+    
+    local ping_result=$(ping -c 1 -W 2 "$remote_tunnel_ip" 2>/dev/null)
+    if [[ $? -eq 0 ]]; then
+        local ping_time=$(echo "$ping_result" | grep -oE 'time=[0-9.]+[[:space:]]*ms|[0-9.]+[[:space:]]*ms' | head -1)
+        if [[ -n "$ping_time" ]]; then
+            local ping_value=$(echo "$ping_time" | grep -oE '[0-9.]+' | head -1)
+            if [[ -n "$ping_value" ]]; then
+                local ping_ms=$(echo "$ping_value" | awk '{printf "%.0f", $1}')
+                echo "${ping_ms} ms"
+            else
+                echo ""
+            fi
+        else
+            echo ""
+        fi
+    else
+        echo ""
+    fi
+}
+
 list_tunnels() {
     banner
     echo -e "${BOLD}${YELLOW}📋 Configured Tunnels:${RESET}"
@@ -384,8 +423,17 @@ show_tunnel_status() {
             fi
         fi
         
+        # get ping time
+        local ping_info=""
+        if [[ "$tunnel_status" == "UP" ]]; then
+            local ping_time=$(get_ping_time "$tunnel_ip" "$version")
+            if [[ -n "$ping_time" ]]; then
+                ping_info=" | ${DIM}Ping:${RESET} ${GREEN}${ping_time}${RESET}"
+            fi
+        fi
+        
         echo -e "${DIM}│${RESET} ${status_icon} ${BOLD}${CYAN}[$count]${RESET} ${CYAN}$tunnel${RESET}"
-        echo -e "${DIM}│${RESET}    ${DIM}Status:${RESET} $status_text | ${DIM}Service:${RESET} $svc_status"
+        echo -e "${DIM}│${RESET}    ${DIM}Status:${RESET} $status_text | ${DIM}Service:${RESET} $svc_status${ping_info}"
         echo -e "${DIM}│${RESET}"
     done < "$CONFIG_FILE"
     
