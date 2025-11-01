@@ -321,7 +321,7 @@ banner() {
     clear
     echo -e "${BOLD}${CYAN}╔══════════════════════════════════════════════════════════════╗${RESET}"
     echo -e "${BOLD}${CYAN}║${RESET}                     ${BOLD}${WHITE}GRE Tunnel Manager${RESET}                       ${BOLD}${CYAN}║${RESET}"
-    echo -e "${BOLD}${CYAN}║${RESET}                        ${DIM}Version 2.1${RESET}                          ${BOLD}${CYAN}║${RESET}"
+    echo -e "${BOLD}${CYAN}║${RESET}                        ${DIM}Version 2.2${RESET}                          ${BOLD}${CYAN}║${RESET}"
     echo -e "${BOLD}${CYAN}║${RESET}                      ${DIM}Author: ${AUTHOR}${RESET}                       ${BOLD}${CYAN}║${RESET}"
     echo -e "${BOLD}${CYAN}╚══════════════════════════════════════════════════════════════╝${RESET}"
     echo
